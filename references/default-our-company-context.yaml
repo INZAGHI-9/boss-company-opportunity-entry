@@ -1,0 +1,54 @@
+company_name: "蝉妈妈"
+context_role: "内容电商增长产品组合"
+portfolio_thesis:
+  - "覆盖内容电商增长中的洞察、内容生产、达人营销与商品分销。"
+  - "用数据和内容能力提升品牌、商家、达人及 MCN 的营销和经营效率。"
+
+products:
+  - id: "chanmama"
+    name: "蝉妈妈"
+    url: "https://chanmama.com"
+    positioning: "电商洞察平台"
+    primary_users: ["品牌", "商家", "达人", "MCN机构"]
+    workflows: ["内容创作", "营销决策", "电商带货"]
+    capabilities: ["内容与创意洞察", "品牌与行业分析", "商品与达人分析", "经营复盘"]
+
+  - id: "chanmama_creative"
+    name: "蝉妈妈·创意"
+    url: "https://cy.chanmama.com"
+    positioning: "视频创意洞察平台"
+    primary_users: ["内容团队", "广告投放团队", "品牌商家"]
+    workflows: ["广告素材洞察", "素材拆解", "视频创作提效"]
+    capabilities: ["广告素材分析", "跑量分析", "脚本拆解", "创作工具"]
+
+  - id: "chanjing"
+    name: "蝉镜"
+    url: "https://chanjing.cc"
+    positioning: "AI爆款内容创作平台"
+    primary_users: ["IP达人", "品牌商家", "企业团队", "教师"]
+    workflows: ["数字人视频", "线索获客", "内容生产"]
+    capabilities: ["数字人视频", "AI文案", "批量成片", "私域引流"]
+
+  - id: "joggai"
+    name: "JoggAI"
+    url: "https://jogg.ai"
+    positioning: "UGC视频广告AI创作工具"
+    primary_users: ["全球品牌广告团队"]
+    workflows: ["全球广告创作", "广告视频批量生产"]
+    capabilities: ["UGC数字人", "链接转视频", "多语种视频", "团队协作"]
+
+  - id: "kolkoc"
+    name: "蝉圈圈"
+    url: "https://kolkoc.com"
+    positioning: "达人营销智能决策与管理平台"
+    primary_users: ["品牌商家", "达人营销团队"]
+    workflows: ["达人筛选", "合作管理", "营销效果追踪"]
+    capabilities: ["达人匹配", "合作管理", "营销衡量", "工作流管理"]
+
+  - id: "chanxuan"
+    name: "蝉选"
+    url: "https://chanxuan.com"
+    positioning: "达人选品服务平台"
+    primary_users: ["达人", "商家"]
+    workflows: ["达人选品", "商家分销", "内容共创"]
+    capabilities: ["高佣选品", "达人变现", "达人分销", "增长服务"]

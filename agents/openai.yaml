@@ -1,0 +1,6 @@
+interface:
+  display_name: "客户商机切入判断"
+  short_description: "从 Boss 招聘采集到商机切入报告的一体化判断"
+  default_prompt: "Use $boss-company-opportunity-entry to collect a company's public Boss jobs and produce an evidence-bounded sales-entry report."
+policy:
+  allow_implicit_invocation: true
