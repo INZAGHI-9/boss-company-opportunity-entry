@@ -18,8 +18,8 @@ description: Use when assessing a potential customer from its public Boss jobs, 
 先读取 [采集合同](references/collection-contract.md)，然后在不要求用户另行运行采集工具的前提下完成以下顺序：
 
 1. 使用本技能内置脚本执行 `--check-login`；未登录时执行 `--login-only`，暂停等待用户完成登录并明确确认，再继续检查。
-2. 未提供 `brandId` 时，使用 `--discover-only` 从搜索首屏取得候选主体；按公司页、产品、岗位与城市确认唯一 `brandId`。仍有歧义时仅请求用户选择，不采集相似主体。
-3. 以已确认的公司名和 `brandId` 运行 `scripts/collector/boss-company-scout.mjs`，取得岗位列表、完整 JD、断点和标准 `analysis-input.json`。Windows 可使用 `--background` 最小化正常 Chrome；安全验证或同页第二次异常时保留断点并暂停，待用户在前台恢复后用同一命令续跑。
+2. 以 `--company <target_company>` 直接搜索候选主体，并按公司名匹配度、公开岗位卡数量和稳定排序自动选择 `brandId`；保存全部候选、选择依据和置信度。只有调用方已明确指定主体时才传入 `--brand-id` 覆盖自动选择；低置信度继续采集并在报告数据校准处提示。
+3. 在同一次正式运行中完成公司页岗位列表、完整 JD、断点和标准 `analysis-input.json`。Windows 可使用 `--background` 最小化正常 Chrome；安全验证或同页第二次异常时保留断点并暂停，待用户在前台恢复后用同一命令续跑。
 4. 将本次 `analysis-input.json` 复制至本次报告目录，并只用其中完整 JD 与允许的目标公司官方资料建立证据账。若快照为 `partial`，报告必须保留其限制，不能声称覆盖全部岗位。
 5. 生成本技能固定的报告和审计附件，并执行本技能的交付校验。
 

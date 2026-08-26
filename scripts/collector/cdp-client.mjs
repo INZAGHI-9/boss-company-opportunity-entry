@@ -62,6 +62,20 @@ async function chromeCommandLines() {
   return stdout.split("\n").map(line => line.trim()).filter(Boolean);
 }
 
+export function discoverDedicatedChromePorts(profileDir, processLines) {
+  const profileArg = `--user-data-dir=${profileDir}`;
+  const ports = new Set();
+  for (const line of processLines) {
+    const normalized = line.replaceAll('"', "");
+    if (!/Google Chrome|chrome|chromium/i.test(normalized) || !normalized.includes(profileArg)) continue;
+    for (const match of normalized.matchAll(/--remote-debugging-port=(\d+)/g)) {
+      const port = Number(match[1]);
+      if (Number.isInteger(port) && port > 0) ports.add(port);
+    }
+  }
+  return [...ports].sort((left, right) => left - right);
+}
+
 async function matchingChromeProcesses(profileDir, port) {
   const profileArg = `--user-data-dir=${profileDir}`;
   const portArg = `--remote-debugging-port=${port}`;
@@ -148,9 +162,10 @@ export async function minimizeDedicatedChromeWindow({ profileDir, port = 9222 })
   if (!stdout.includes("WINDOW_MINIMIZED=true")) throw new Error("专用 Chrome 未确认最小化");
 }
 
-export async function launchOrConnectChrome({ profileDir, port = 9222, minimized = false }) {
+export async function launchOrConnectChrome({ profileDir, port = 9222, minimized = false, reuseExistingPort = true }) {
   await mkdir(profileDir, { recursive: true });
-  const endpoint = `http://127.0.0.1:${port}/json/version`;
+  let activePort = port;
+  const endpoint = `http://127.0.0.1:${activePort}/json/version`;
   let version;
   try {
     version = await fetchJson(endpoint);
@@ -158,35 +173,50 @@ export async function launchOrConnectChrome({ profileDir, port = 9222, minimized
     version = null;
   }
 
-  const matching = await matchingChromeProcesses(profileDir, port);
+  if (!version && reuseExistingPort) {
+    const processLines = await chromeCommandLines();
+    for (const candidatePort of discoverDedicatedChromePorts(profileDir, processLines)) {
+      if (candidatePort === activePort) continue;
+      try {
+        version = await fetchJson(`http://127.0.0.1:${candidatePort}/json/version`);
+        activePort = candidatePort;
+        break;
+      } catch {
+        // Ignore stale Chrome command lines and try the next matching dedicated port.
+      }
+    }
+  }
+
+  const matching = await matchingChromeProcesses(profileDir, activePort);
   if (version && matching.length === 0) {
     throw new Error(
-      `CDP 端口 ${port} 已被其他 Chrome 占用。请关闭占用者，或用 --cdp-port 指定其他端口。`,
+      `CDP 端口 ${activePort} 已被其他 Chrome 占用。请关闭占用者，或用 --cdp-port 指定其他端口。`,
     );
   }
 
   if (version && isBackgroundChrome(matching) !== minimized) {
-    await stopDedicatedChrome({ profileDir, port });
+    await stopDedicatedChrome({ profileDir, port: activePort });
     await sleep(500);
     version = null;
+    activePort = port;
   }
 
   if (!version) {
     const chromePath = await findChromePath();
-    const child = spawn(chromePath, chromeLaunchArgs({ profileDir, port, minimized }), {
+    const child = spawn(chromePath, chromeLaunchArgs({ profileDir, port: activePort, minimized }), {
       detached: true,
       stdio: "ignore",
     });
     child.unref();
     await writeFile(path.join(profileDir, "chrome.pid"), `${child.pid}\n`);
-    version = await waitForDebugger(port);
+    version = await waitForDebugger(activePort);
   }
 
   if (!version.webSocketDebuggerUrl) throw new Error("Chrome 未返回 webSocketDebuggerUrl");
   return {
     client: await CdpClient.connect(version.webSocketDebuggerUrl),
     browserVersion: version.Browser || "Chrome",
-    port,
+    port: activePort,
   };
 }
 

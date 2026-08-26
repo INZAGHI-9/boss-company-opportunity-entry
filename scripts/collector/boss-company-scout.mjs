@@ -22,7 +22,7 @@ import { createJsonCheckpointWriter } from "./checkpoint-writer.mjs";
 import { companyHomeUrl, companyJobUrl } from "./company-navigation.mjs";
 import { conflictingCompanyPages, mergeCompanyPageJobs, remainingCompanyPages } from "./company-page-batch.mjs";
 import { waitForResult } from "./page-readiness.mjs";
-import { MAX_CONCURRENT_PAGES, runRecoveryQueue } from "./recovery-queue.mjs";
+import { MAX_CONCURRENT_PAGES, runRecoveryQueue, runSequentialFallback } from "./recovery-queue.mjs";
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(homedir(), ".codex");
 const DATA_ROOT = path.resolve(process.env.BOSS_OPPORTUNITY_ENTRY_HOME || path.join(CODEX_HOME, "boss-company-opportunity-entry"));
@@ -48,6 +48,7 @@ function parseArgs(argv) {
     minDelay: 2_500,
     maxDelay: 4_500,
     cdpPort: 9222,
+    cdpPortExplicit: false,
     parallelPages: true,
     parallelDetails: true,
     previousJobs: null,
@@ -61,7 +62,7 @@ function parseArgs(argv) {
     else if (arg === "--brand-id" && next) options.brandId = next, index += 1;
     else if (arg === "--max-pages" && next) options.maxPages = Number(next), index += 1;
     else if (arg === "--max-jobs" && next) options.maxJobs = Number(next), index += 1;
-    else if (arg === "--cdp-port" && next) options.cdpPort = Number(next), index += 1;
+    else if (arg === "--cdp-port" && next) options.cdpPort = Number(next), options.cdpPortExplicit = true, index += 1;
     else if (arg === "--parallel-pages") options.parallelPages = true;
     else if (arg === "--parallel-details") options.parallelDetails = true;
     else if (arg === "--previous-jobs" && next) options.previousJobs = next, index += 1;
@@ -468,7 +469,8 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
   }]]);
   const failures = new Map();
   const existingCheckpoint = await loadJson(checkpointPath, null);
-  if (existingCheckpoint?.candidate?.brandId === candidate.brandId
+  if (!options.refreshListing
+    && existingCheckpoint?.candidate?.brandId === candidate.brandId
     && existingCheckpoint?.advertisedTotal === advertisedTotal) {
     for (const result of existingCheckpoint.pages || []) {
       if (result?.sourcePage > 1 && Array.isArray(result.jobs) && result.jobs.length) {
@@ -524,6 +526,7 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
         },
       });
       if (recovery.paused.length) throw recoveryError("公司岗位列表采集", recovery.paused);
+      if (recovery.failed.length) throw recoveryError("公司岗位列表采集", recovery.failed);
     };
     const rebuildJobs = () => {
       jobs.clear();
@@ -625,19 +628,35 @@ function companyCandidates(jobs, query) {
 
 function selectCompany(jobs, candidates, options) {
   let matches = candidates;
+  let entityResolution;
   if (options.brandId) matches = candidates.filter(candidate => candidate.brandId === options.brandId);
   else if (options.companyName) {
     const requested = normalizeCompany(options.companyName);
     matches = candidates.filter(candidate => normalizeCompany(candidate.company) === requested);
   }
-  if (matches.length !== 1) {
-    const reason = matches.length ? "仍有多个公司主体" : "没有匹配的公司主体";
-    throw new Error(`${reason}。请先使用 --discover-only，再通过 --brand-id 精确指定`);
-  }
+  if (!matches.length) throw new Error("没有匹配的公司主体，无法建立招聘快照");
   const selected = matches[0];
+  if (options.brandId || options.companyName) {
+    entityResolution = { mode: "explicit", confidence: "high", candidateCount: matches.length, selectedBrandId: selected.brandId };
+  } else {
+    const second = matches[1];
+    const query = normalizeCompany(options.company || "");
+    const exact = normalizeCompany(selected.company) === query;
+    const confidence = !second || exact ? "high" : selected.count > second.count ? "medium" : "low";
+    entityResolution = {
+      mode: "automatic",
+      confidence,
+      candidateCount: matches.length,
+      selectedBrandId: selected.brandId,
+      selectedCompany: selected.company,
+      competingCandidates: matches.map(candidate => ({ brandId: candidate.brandId, company: candidate.company, advertisedJobCount: candidate.count })),
+      basis: "候选主体与输入公司名的匹配度、公开岗位卡数量和稳定排序",
+    };
+  }
   return {
     candidate: selected,
     jobs: jobs.filter(job => job.brandId === selected.brandId),
+    entityResolution,
   };
 }
 
@@ -830,6 +849,31 @@ async function collectCompanyDetails(client, page, options, candidate, jobs, det
     });
     await persistCheckpoint.flush();
     if (recovery.paused.length) throw recoveryError("岗位 JD 采集", recovery.paused);
+    if (recovery.failed.length) {
+      console.log(`并行详情页未完成，改为单页续采：${recovery.failed.map(failure => failure.item).join("、")}`);
+      const fallback = await runSequentialFallback(recovery.failed.map(failure => failure.item), {
+        worker: async pageNumber => collectCompanyPageDetails(
+          client,
+          page,
+          parallelOptions,
+          candidate,
+          groups.get(pageNumber),
+          details,
+          false,
+          persistCheckpoint,
+        ),
+        onAttemptError: async ({ item, error }) => {
+          console.log(`第 ${item} 页 JD 单页续采失败：${error.message}`);
+          await persistCheckpoint();
+        },
+      });
+      await persistCheckpoint.flush();
+      if (fallback.failed.length) {
+        const error = recoveryError("岗位 JD 单页续采", fallback.failed);
+        error.code = "DETAIL_LIST_REFRESH_REQUIRED";
+        throw error;
+      }
+    }
     return targets;
   }
   const pageNumbers = [...new Set(targets.filter(job => !details.has(job.jobId)).map(job => job.sourcePage))]
@@ -855,6 +899,12 @@ async function collectCompanyDetails(client, page, options, candidate, jobs, det
   }
   await persistCheckpoint.flush();
   return targets;
+}
+
+function assertCompleteDetails(targets, details) {
+  const missing = targets.filter(job => !String(details.get(job.jobId)?.description || "").trim());
+  if (!missing.length) return;
+  throw new Error(`岗位 JD 未完整读取：${missing.map(job => job.jobId).join("、")}`);
 }
 
 async function atomicWrite(filePath, content) {
@@ -1820,11 +1870,11 @@ function csvCell(value) {
   return `"${text.replaceAll('"', '""')}"`;
 }
 
-async function saveOutputs(directory, jobs, candidate, coverage, previousSnapshot = null) {
+async function saveOutputs(directory, jobs, candidate, coverage, previousSnapshot = null, entityResolution = null) {
   const capturedAt = new Date().toISOString();
   const normalizedJobs = jobs.map(job => ({ ...job, location: normalizeLocation(job.location) }));
   const analysis = analyze(normalizedJobs, candidate, coverage);
-  const analysisInput = createAnalysisInput({ candidate, coverage, capturedAt, jobs: normalizedJobs });
+  const analysisInput = createAnalysisInput({ candidate, coverage, capturedAt, jobs: normalizedJobs, entityResolution });
   const headers = [
     "jobId", "brandId", "company", "title", "salary", "city", "district", "businessDistrict",
     "experience", "degree", "skills", "labels", "benefits", "companyScale", "companyStage",
@@ -1874,6 +1924,7 @@ async function main() {
     profileDir: PROFILE_DIR,
     port: options.cdpPort,
     minimized: options.background,
+    reuseExistingPort: !options.cdpPortExplicit,
   });
   console.log(`已连接 ${browserVersion}（CDP ${port}${options.background ? "，后台模式" : ""}）`);
 
@@ -1895,6 +1946,7 @@ async function main() {
       return;
     }
     let candidate;
+    let entityResolution = null;
     if (options.brandId) {
       if (options.discoverOnly) throw new Error("--discover-only 不需要 --brand-id");
       candidate = {
@@ -1904,6 +1956,7 @@ async function main() {
         cities: [],
         companyLink: `https://www.zhipin.com/gongsi/${options.brandId}.html`,
       };
+      entityResolution = { mode: "explicit", confidence: "high", candidateCount: 1, selectedBrandId: candidate.brandId };
       console.log(`使用指定 Boss 公司 ID：${candidate.brandId}`);
     } else {
       const search = await collectSearchResults(client, page, options);
@@ -1923,53 +1976,69 @@ async function main() {
         console.log(`\n发现结果：${discoveryDirectory}`);
         return;
       }
-      candidate = selectCompany(search.jobs, candidates, options).candidate;
+      const selection = selectCompany(search.jobs, candidates, options);
+      candidate = selection.candidate;
+      entityResolution = selection.entityResolution;
     }
     assertPreviousSnapshotCandidate(previousSnapshot, candidate);
     const runDirectory = path.join(OUTPUT_ROOT, `${slugify(candidate.company)}-${candidate.brandId}-latest`);
     await mkdir(runDirectory, { recursive: true });
-    const companyList = await collectCompanyJobs(
-      client,
-      page,
-      options,
-      candidate,
-      path.join(runDirectory, "list-checkpoint.json"),
-    );
-    candidate = {
-      ...candidate,
-      count: companyList.jobs.length,
-      cities: [...new Set(companyList.jobs.map(job => job.city).filter(Boolean))].sort(),
-    };
-    await writeJson(path.join(runDirectory, "list.json"), {
-      capturedAt: new Date().toISOString(),
-      candidate,
-      coverage: companyList.coverage,
-      jobs: companyList.jobs,
-    });
-
     const checkpointPath = path.join(runDirectory, "checkpoint.json");
-    const checkpoint = await loadJson(checkpointPath, []);
-    const currentIds = new Set(companyList.jobs.map(job => job.jobId));
-    const details = new Map(
-      checkpoint
-        .filter(job => currentIds.has(job.jobId) && job.description && !job.detailWarning)
-        .map(job => [job.jobId, job]),
-    );
-    const targets = await collectCompanyDetails(
-      client,
-      page,
-      options,
-      candidate,
-      companyList.jobs,
-      details,
-      checkpointPath,
-    );
+    let companyList;
+    let details;
+    let targets;
+    for (let listingRefresh = 0; listingRefresh < 2; listingRefresh += 1) {
+      const collectionOptions = listingRefresh ? { ...options, refreshListing: true } : options;
+      if (listingRefresh) console.log("单页续采仍未读到详情，刷新当前岗位列表后继续采集。");
+      companyList = await collectCompanyJobs(
+        client,
+        page,
+        collectionOptions,
+        candidate,
+        path.join(runDirectory, "list-checkpoint.json"),
+      );
+      candidate = {
+        ...candidate,
+        count: companyList.jobs.length,
+        cities: [...new Set(companyList.jobs.map(job => job.city).filter(Boolean))].sort(),
+      };
+      await writeJson(path.join(runDirectory, "list.json"), {
+        capturedAt: new Date().toISOString(),
+        candidate,
+        coverage: companyList.coverage,
+        jobs: companyList.jobs,
+      });
+
+      const checkpoint = await loadJson(checkpointPath, []);
+      const currentIds = new Set(companyList.jobs.map(job => job.jobId));
+      details = new Map(
+        checkpoint
+          .filter(job => currentIds.has(job.jobId) && job.description && !job.detailWarning)
+          .map(job => [job.jobId, job]),
+      );
+      try {
+        targets = await collectCompanyDetails(
+          client,
+          page,
+          collectionOptions,
+          candidate,
+          companyList.jobs,
+          details,
+          checkpointPath,
+        );
+        break;
+      } catch (error) {
+        if (error?.code !== "DETAIL_LIST_REFRESH_REQUIRED" || listingRefresh) throw error;
+      }
+    }
+    if (!companyList || !details || !targets) throw new Error("岗位 JD 采集未形成完整快照");
+    assertCompleteDetails(targets, details);
 
     const jobs = companyList.jobs.map(job => details.get(job.jobId) || {
       ...job,
       detailWarning: options.maxJobs ? "受 --max-jobs 限制，未读取详情" : "详情尚未读取",
     });
-    await saveOutputs(runDirectory, jobs, candidate, companyList.coverage, previousSnapshot);
+    await saveOutputs(runDirectory, jobs, candidate, companyList.coverage, previousSnapshot, entityResolution);
     console.log(`\n完成：公司页 ${jobs.length} 个岗位，读取 ${details.size}/${targets.length} 个目标详情`);
     console.log(`分析输入：${path.join(runDirectory, "analysis-input.json")}`);
     console.log(`CSV：${path.join(runDirectory, "jobs.csv")}`);
@@ -1978,7 +2047,7 @@ async function main() {
   }
 }
 
-export { analyze, compareSnapshots, saveOutputs };
+export { analyze, assertCompleteDetails, compareSnapshots, saveOutputs, selectCompany };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(error => {

@@ -24,7 +24,8 @@ test("packages the complete Boss collector inside the opportunity-entry skill", 
 
   const instructions = readFileSync(path.join(skillDirectory, "SKILL.md"), "utf8");
   assert.match(instructions, /scripts\/collector\/boss-company-scout\.mjs/);
-  assert.match(instructions, /--check-login[\s\S]*--discover-only[\s\S]*完整 JD[\s\S]*opportunity-entry-report\.md/);
+  assert.match(instructions, /--check-login[\s\S]*自动选择 `brandId`[\s\S]*完整 JD[\s\S]*opportunity-entry-report\.md/);
+  assert.doesNotMatch(instructions, /仅请求用户选择/);
   assert.doesNotMatch(instructions, /boss-company-talent-map/);
 });
 
@@ -75,4 +76,29 @@ test("emits the analysis-input contract required by the opportunity report", asy
     employmentMode: null,
     description: "完整 JD",
   }]);
+});
+
+test("retains the business-and-talent collector safeguards while adapting only the output contract", async () => {
+  const scout = readFileSync(path.join(collectorDirectory, "boss-company-scout.mjs"), "utf8");
+  assert.match(scout, /cdpPortExplicit/);
+  assert.match(scout, /runSequentialFallback/);
+  assert.match(scout, /assertCompleteDetails/);
+
+  const recoveryModule = pathToFileURL(path.join(collectorDirectory, "recovery-queue.mjs")).href;
+  const { runRecoveryQueue, runSequentialFallback } = await import(recoveryModule);
+  assert.equal(typeof runSequentialFallback, "function");
+
+  const result = await runRecoveryQueue(["failed"], {
+    concurrency: 1,
+    maxAttempts: 2,
+    retryDelay: () => 0,
+    worker: async (_item, { attempt }) => {
+      throw new Error(attempt >= 3 ? "manual stop" : "detail unavailable");
+    },
+    isManualRecoveryError: error => error.message === "manual stop",
+  });
+
+  assert.equal(result.paused.length, 0);
+  assert.equal(result.failed.length, 1);
+  assert.equal(result.failed[0].attempts, 2);
 });
