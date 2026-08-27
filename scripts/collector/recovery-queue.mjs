@@ -12,6 +12,7 @@ function wait(milliseconds) {
 async function runRecoveryQueue(items, {
   concurrency = MAX_CONCURRENT_PAGES,
   maxAttempts = DEFAULT_MAX_ATTEMPTS,
+  workerContexts = null,
   worker,
   retryDelay = defaultRetryDelay,
   isManualRecoveryError = () => false,
@@ -25,27 +26,31 @@ async function runRecoveryQueue(items, {
   const failed = [];
   const paused = [];
   const attemptLimit = Math.max(1, Number.isInteger(maxAttempts) ? maxAttempts : DEFAULT_MAX_ATTEMPTS);
+  const availableContexts = Array.isArray(workerContexts) && workerContexts.length
+    ? workerContexts
+    : Array.from({ length: queue.length }, () => undefined);
   const workerCount = Math.min(
     MAX_CONCURRENT_PAGES,
     Math.max(1, Number.isInteger(concurrency) ? concurrency : MAX_CONCURRENT_PAGES),
     queue.length,
+    availableContexts.length,
   );
   let pausedForManualRecovery = false;
 
-  async function runWorker() {
+  async function runWorker(workerContext) {
     while (!pausedForManualRecovery && queue.length) {
       const item = queue.shift();
       let attempt = 0;
       while (true) {
         attempt += 1;
         try {
-          const value = await worker(item, { attempt });
+          const value = await worker(item, { attempt, workerContext });
           const result = { item, value, attempts: attempt };
           completed.push(result);
           await onCompleted(result);
           break;
         } catch (error) {
-          const failure = { item, error, attempts: attempt };
+          const failure = { item, error, attempts: attempt, workerContext };
           await onAttemptError(failure);
           if (isManualRecoveryError(error, failure)) {
             pausedForManualRecovery = true;
@@ -62,7 +67,7 @@ async function runRecoveryQueue(items, {
     }
   }
 
-  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  await Promise.all(availableContexts.slice(0, workerCount).map(workerContext => runWorker(workerContext)));
   return { completed, failed, paused, remaining: [...queue] };
 }
 

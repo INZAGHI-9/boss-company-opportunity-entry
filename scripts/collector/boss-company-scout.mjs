@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import {
   attachSinglePage,
   closePage,
+  createFixedPagePool,
   enforceSinglePage,
   evaluate,
   getPageState,
@@ -22,7 +23,8 @@ import { createJsonCheckpointWriter } from "./checkpoint-writer.mjs";
 import { companyHomeUrl, companyJobUrl } from "./company-navigation.mjs";
 import { conflictingCompanyPages, mergeCompanyPageJobs, remainingCompanyPages } from "./company-page-batch.mjs";
 import { waitForResult } from "./page-readiness.mjs";
-import { MAX_CONCURRENT_PAGES, runRecoveryQueue, runSequentialFallback } from "./recovery-queue.mjs";
+import { runRecoveryQueue, runSequentialFallback } from "./recovery-queue.mjs";
+import { acquireScoutRunLock } from "./scout-run-lock.mjs";
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(homedir(), ".codex");
 const DATA_ROOT = path.resolve(process.env.BOSS_OPPORTUNITY_ENTRY_HOME || path.join(CODEX_HOME, "boss-company-opportunity-entry"));
@@ -32,6 +34,7 @@ const BOSS_HOME = "https://www.zhipin.com/";
 const SEARCH_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json";
 const COMPANY_JOB_LIST_PATH = "/wapi/zpgeek/brand/job/querylist.json";
 const JOB_DETAIL_PATH = "/wapi/zpgeek/seo/job/detail.json";
+const FIXED_WORKER_COUNT = 3;
 
 function parseArgs(argv) {
   const options = {
@@ -330,7 +333,7 @@ async function collectSearchResults(client, page, options) {
 function isManualRecoveryError(error, failure = {}) {
   const message = error?.message || "";
   if (/登录状态不可用/i.test(message)) return true;
-  if (/安全验证|限制访问|about:blank/i.test(message)) return (failure.attempts || 1) > 1;
+  if (/安全验证|限制访问|about:blank/i.test(message)) return true;
   return false;
 }
 
@@ -352,9 +355,21 @@ function companyPageSummaryExpression(brandId, companyName, sourcePage = 1) {
       || pageText.match(/招聘职位\\s*[（(](\\d+)[）)]/)?.[1]
       || 0
     );
+    const pageNumbers = [...document.querySelectorAll('a[ka^="page-"], a[href*="?page="]')]
+      .flatMap(link => {
+        const href = link.getAttribute("href") || "";
+        const fromHref = href.match(/[?&]page=(\\d+)/)?.[1];
+        const fromText = clean(link).match(/^\\d+$/)?.[0];
+        return [fromHref || fromText].filter(Boolean).map(Number);
+      })
+      .filter(Number.isInteger);
+    const next = document.querySelector('a[ka="page-next"]');
+    const hasMore = Boolean(next && !next.classList.contains("disabled") && next.getAttribute("aria-disabled") !== "true");
     const pageCompany = document.title.match(/「(.+?)招聘」/)?.[1] || ${JSON.stringify(companyName)};
     return {
       advertisedTotal,
+      lastPage: pageNumbers.length ? Math.max(...pageNumbers) : null,
+      hasMore,
       company: pageCompany,
       jobs: cards.map((card, sourceIndex) => {
         const anchor = card.querySelector("a.job-name[href*='/job_detail/']");
@@ -405,36 +420,24 @@ async function clickCompanyNextPage(client, sessionId) {
   if (!clicked) throw new Error("公司岗位页没有可用的下一页按钮");
 }
 
-async function collectParallelCompanyPage(client, candidate, sourcePage, attempt = 1, isLastPage = false) {
-  const page = await openAdditionalPage(client);
-  let preservePage = false;
-  try {
-    await navigate(
-      client,
-      page.sessionId,
-      companyJobUrl(candidate.brandId, sourcePage),
-    );
-    await sleep(500);
-    assertPageAccessible(await getPageState(client, page.sessionId));
-    const renderedPage = await evaluate(
-      client,
-      page.sessionId,
-      companyPageSummaryExpression(candidate.brandId, candidate.company, sourcePage),
-    );
-    const jobs = mergeCompanyPageJobs(renderedPage.jobs);
-    if (!jobs.length) throw new Error(`公司岗位第 ${sourcePage} 页未渲染岗位卡片`);
-    return {
-      sourcePage,
-      jobs,
-      apiTotal: null,
-      hasMore: !isLastPage,
-    };
-  } catch (error) {
-    preservePage = isManualRecoveryError(error, { attempts: attempt });
-    throw error;
-  } finally {
-    if (!preservePage) await closePage(client, page.targetId);
-  }
+async function collectParallelCompanyPage(client, page, candidate, sourcePage) {
+  await navigate(client, page.sessionId, companyJobUrl(candidate.brandId, sourcePage));
+  await sleep(500);
+  assertPageAccessible(await getPageState(client, page.sessionId));
+  const renderedPage = await evaluate(
+    client,
+    page.sessionId,
+    companyPageSummaryExpression(candidate.brandId, candidate.company, sourcePage),
+  );
+  const jobs = mergeCompanyPageJobs(renderedPage.jobs);
+  if (!jobs.length) throw new Error(`公司岗位第 ${sourcePage} 页未渲染岗位卡片`);
+  return {
+    sourcePage,
+    jobs,
+    apiTotal: null,
+    lastPage: renderedPage.lastPage,
+    hasMore: renderedPage.hasMore,
+  };
 }
 
 async function collectCompanyJobs(client, page, options, candidate, checkpointPath) {
@@ -458,13 +461,15 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
   let advertisedTotal = firstPage.advertisedTotal;
   let apiTotal = null;
   let pagesCaptured = 1;
-  let lastHasMore = advertisedTotal > jobs.size;
+  let lastPage = firstPage.lastPage;
+  let lastHasMore = firstPage.hasMore;
   console.log(`公司岗位第 1 页：${firstPage.jobs.length} 条，页面公布 ${advertisedTotal || "未知"} 条`);
 
   const pageResults = new Map([[1, {
     sourcePage: 1,
     jobs: firstPage.jobs,
     apiTotal: null,
+    lastPage,
     hasMore: lastHasMore,
   }]]);
   const failures = new Map();
@@ -484,6 +489,7 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
       candidate,
       advertisedTotal,
       apiTotal,
+      lastPage,
       pages: [...pageResults.values()].sort((left, right) => left.sourcePage - right.sourcePage),
       failures: [...failures.entries()].map(([sourcePage, failure]) => ({
         sourcePage,
@@ -496,35 +502,44 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
   const parallelPages = remainingCompanyPages({
     advertisedTotal,
     firstPageSize: firstPage.jobs.length,
+    lastPage,
     maxPages: options.maxPages,
   });
   if (options.parallelPages && parallelPages.length) {
     const capturePages = async sourcePages => {
-      console.log(`并行加载公司岗位第 ${parallelPages[0]}-${parallelPages.at(-1)} 页：最多 ${MAX_CONCURRENT_PAGES} 个标签页，待读取 ${sourcePages.length} 页`);
-      const recovery = await runRecoveryQueue(sourcePages, {
-        concurrency: MAX_CONCURRENT_PAGES,
-        worker: async (sourcePage, { attempt }) => {
+      console.log(`并行加载公司岗位第 ${parallelPages[0]}-${parallelPages.at(-1)} 页：固定 ${FIXED_WORKER_COUNT} 个工作页，待读取 ${sourcePages.length} 页`);
+      const pool = await createFixedPagePool(client, Math.min(FIXED_WORKER_COUNT, sourcePages.length));
+      let recovery;
+      try {
+        recovery = await runRecoveryQueue(sourcePages, {
+          concurrency: pool.workers.length,
+          maxAttempts: 2,
+          workerContexts: pool.workers,
+          worker: async (sourcePage, { attempt, workerContext }) => {
           if (attempt > 1) console.log(`恢复公司岗位第 ${sourcePage} 页，第 ${attempt} 次尝试`);
           return collectParallelCompanyPage(
             client,
+            workerContext,
             candidate,
             sourcePage,
-            attempt,
-            sourcePage === parallelPages.at(-1),
           );
-        },
-        isManualRecoveryError,
-        onAttemptError: async failure => {
-          failures.set(failure.item, failure);
-          await persistListingCheckpoint();
-        },
-        onCompleted: async ({ value }) => {
-          pageResults.set(value.sourcePage, value);
-          failures.delete(value.sourcePage);
-          apiTotal = value.apiTotal || apiTotal;
-          await persistListingCheckpoint();
-        },
-      });
+          },
+          isManualRecoveryError,
+          onAttemptError: async failure => {
+            failures.set(failure.item, failure);
+            await persistListingCheckpoint();
+          },
+          onCompleted: async ({ value }) => {
+            pageResults.set(value.sourcePage, value);
+            failures.delete(value.sourcePage);
+            apiTotal = value.apiTotal || apiTotal;
+            lastPage = value.lastPage || lastPage;
+            await persistListingCheckpoint();
+          },
+        });
+      } finally {
+        await pool.close({ preserveTargetIds: recovery?.paused.map(failure => failure.workerContext?.targetId) || [] });
+      }
       if (recovery.paused.length) throw recoveryError("公司岗位列表采集", recovery.paused);
       if (recovery.failed.length) throw recoveryError("公司岗位列表采集", recovery.failed);
     };
@@ -535,23 +550,19 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
         for (const job of result.jobs) jobs.set(job.jobId, job);
         pagesCaptured = Math.max(pagesCaptured, result.sourcePage);
         apiTotal = result.apiTotal || apiTotal;
-        lastHasMore = result.hasMore;
+        lastPage = result.lastPage || lastPage;
         if (result.sourcePage > 1) console.log(`公司岗位第 ${result.sourcePage} 页：${result.jobs.length} 条，累计去重 ${jobs.size}/${advertisedTotal || apiTotal || "?"}`);
       }
+      const terminalPage = lastPage || Math.max(...pageResults.keys());
+      lastHasMore = pageResults.get(terminalPage)?.hasMore ?? false;
     };
 
     await persistListingCheckpoint();
     await capturePages(parallelPages.filter(sourcePage => !pageResults.has(sourcePage)));
     rebuildJobs();
-    while (jobs.size !== advertisedTotal || lastHasMore) {
-      const conflictPages = conflictingCompanyPages([...pageResults.values()]);
-      const pagesToRefresh = conflictPages.length ? conflictPages : parallelPages;
-      console.log(`公司岗位页去重 ${jobs.size}/${advertisedTotal}，仅恢复第 ${pagesToRefresh.join("、")} 页`);
-      for (const sourcePage of pagesToRefresh) pageResults.delete(sourcePage);
-      await persistListingCheckpoint();
-      await sleep(1_000);
-      await capturePages(pagesToRefresh);
-      rebuildJobs();
+    const conflictPages = conflictingCompanyPages([...pageResults.values()]);
+    if (conflictPages.length) {
+      console.log(`公司岗位页存在重复卡片：${conflictPages.join("、")}；本次保留可见快照，不循环刷新页面。`);
     }
   } else if (lastHasMore) {
     const capture = new ResponseCapture(client, page.sessionId, COMPANY_JOB_LIST_PATH, "公司岗位接口");
@@ -595,11 +606,7 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
     lastHasMore,
     maxPages: options.maxPages,
   };
-  if (!complete) {
-    throw new Error(
-      `公司岗位全集不完整：页面公布 ${expectedTotal} 条，实际去重 ${jobs.size} 条，已读取 ${pagesCaptured} 页`,
-    );
-  }
+  if (!complete) console.log(`公司岗位快照不完整：页面公布 ${expectedTotal} 条，实际去重 ${jobs.size} 条，已读取 ${pagesCaptured} 页。`);
   return { jobs: [...jobs.values()], coverage };
 }
 
@@ -815,18 +822,20 @@ async function collectCompanyDetails(client, page, options, candidate, jobs, det
       groups.set(job.sourcePage, group);
     }
     const pageNumbers = [...groups.keys()].sort((left, right) => left - right);
-    console.log(`按岗位分页并行读取详情：最多 ${MAX_CONCURRENT_PAGES} 个标签页，${pending.length} 份 JD`);
+    console.log(`按岗位分页并行读取详情：固定 ${FIXED_WORKER_COUNT} 个工作页，${pending.length} 份 JD`);
     const parallelOptions = { ...options, allTargets: targets };
-    const recovery = await runRecoveryQueue(pageNumbers, {
-      concurrency: MAX_CONCURRENT_PAGES,
-      worker: async (pageNumber, { attempt }) => {
-        const detailPage = await openAdditionalPage(client);
-        let preservePage = false;
-        try {
+    const pool = await createFixedPagePool(client, Math.min(FIXED_WORKER_COUNT, pageNumbers.length));
+    let recovery;
+    try {
+      recovery = await runRecoveryQueue(pageNumbers, {
+        concurrency: pool.workers.length,
+        maxAttempts: 2,
+        workerContexts: pool.workers,
+        worker: async (pageNumber, { attempt, workerContext }) => {
           if (attempt > 1) console.log(`恢复第 ${pageNumber} 页 JD，第 ${attempt} 次尝试`);
           await collectCompanyPageDetails(
             client,
-            detailPage,
+            workerContext,
             parallelOptions,
             candidate,
             groups.get(pageNumber),
@@ -834,19 +843,16 @@ async function collectCompanyDetails(client, page, options, candidate, jobs, det
             true,
             persistCheckpoint,
           );
-        } catch (error) {
-          preservePage = isManualRecoveryError(error, { attempts: attempt });
-          throw error;
-        } finally {
-          if (!preservePage) await closePage(client, detailPage.targetId);
-        }
-      },
-      isManualRecoveryError,
-      onAttemptError: async ({ item, attempts, error }) => {
-        console.log(`第 ${item} 页 JD 第 ${attempts} 次失败：${error.message}`);
-        await persistCheckpoint();
-      },
-    });
+        },
+        isManualRecoveryError,
+        onAttemptError: async ({ item, attempts, error }) => {
+          console.log(`第 ${item} 页 JD 第 ${attempts} 次失败：${error.message}`);
+          await persistCheckpoint();
+        },
+      });
+    } finally {
+      await pool.close({ preserveTargetIds: recovery?.paused.map(failure => failure.workerContext?.targetId) || [] });
+    }
     await persistCheckpoint.flush();
     if (recovery.paused.length) throw recoveryError("岗位 JD 采集", recovery.paused);
     if (recovery.failed.length) {
@@ -1107,7 +1113,7 @@ ${markdownTable(jobRows, ["岗位", "地点", "薪资", "经验", "学历", "职
 
 - “全国全部岗位”指本次登录状态下，该 Boss 公司招聘职位页公开展示的全部当前岗位，不代表公司的内部编制总表。
 - 单次快照适合识别地域和职能重心；判断扩张、收缩或业务转向需要按周或双周比较岗位新增和下线。
-- 只有公司页遍历结束且去重岗位数等于页面公布总数时才标记为完整；安全验证或页数上限会使任务失败。
+- 只有公司页遍历结束且去重岗位数等于页面公布总数时才标记为完整；安全验证会暂停采集，页数上限或数量差额会标记为部分快照。
 `;
 }
 
@@ -1920,16 +1926,20 @@ async function main() {
   }
 
   await mkdir(OUTPUT_ROOT, { recursive: true });
-  const { client, browserVersion, port } = await launchOrConnectChrome({
-    profileDir: PROFILE_DIR,
-    port: options.cdpPort,
-    minimized: options.background,
-    reuseExistingPort: !options.cdpPortExplicit,
+  const runLock = await acquireScoutRunLock(DATA_ROOT, {
+    company: options.company || options.companyName,
+    cdpPort: options.cdpPort,
   });
-  console.log(`已连接 ${browserVersion}（CDP ${port}${options.background ? "，后台模式" : ""}）`);
-
   try {
-    const page = await attachSinglePage(client);
+    const { client, browserVersion, port } = await launchOrConnectChrome({
+      profileDir: PROFILE_DIR,
+      port: options.cdpPort,
+      minimized: options.background,
+      reuseExistingPort: !options.cdpPortExplicit,
+    });
+    console.log(`已连接 ${browserVersion}（CDP ${port}${options.background ? "，后台模式" : ""}）`);
+    try {
+      const page = await attachSinglePage(client);
     await enforceSinglePage(client, page.targetId);
     if (options.background) await minimizeDedicatedChromeWindow({ profileDir: PROFILE_DIR, port: options.cdpPort });
     if (options.loginOnly) {
@@ -2042,8 +2052,11 @@ async function main() {
     console.log(`\n完成：公司页 ${jobs.length} 个岗位，读取 ${details.size}/${targets.length} 个目标详情`);
     console.log(`分析输入：${path.join(runDirectory, "analysis-input.json")}`);
     console.log(`CSV：${path.join(runDirectory, "jobs.csv")}`);
+    } finally {
+      client.close();
+    }
   } finally {
-    client.close();
+    await runLock.release();
   }
 }
 

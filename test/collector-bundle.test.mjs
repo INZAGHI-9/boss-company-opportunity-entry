@@ -15,6 +15,7 @@ const requiredModules = [
   "company-page-batch.mjs",
   "page-readiness.mjs",
   "recovery-queue.mjs",
+  "scout-run-lock.mjs",
 ];
 
 test("packages the complete Boss collector inside the opportunity-entry skill", () => {

@@ -355,6 +355,29 @@ export async function openAdditionalPage(client) {
   return { targetId, sessionId };
 }
 
+export async function createFixedPagePool(client, count) {
+  const workerCount = Math.max(1, Number.isInteger(count) ? count : 1);
+  const workers = [];
+  try {
+    for (let index = 0; index < workerCount; index += 1) workers.push(await openAdditionalPage(client));
+  } catch (error) {
+    await Promise.all(workers.map(worker => closePage(client, worker.targetId)));
+    throw error;
+  }
+  let closed = false;
+  return {
+    workers,
+    async close({ preserveTargetIds = [] } = {}) {
+      if (closed) return;
+      closed = true;
+      const preserved = new Set(preserveTargetIds);
+      await Promise.all(workers
+        .filter(worker => !preserved.has(worker.targetId))
+        .map(worker => closePage(client, worker.targetId)));
+    },
+  };
+}
+
 export async function closePage(client, targetId) {
   await client.send("Target.closeTarget", { targetId }).catch(() => {});
 }

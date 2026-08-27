@@ -1,7 +1,6 @@
-function remainingCompanyPages({ advertisedTotal, firstPageSize, maxPages }) {
-  if (!Number.isInteger(advertisedTotal) || advertisedTotal <= 0) return [];
-  if (!Number.isInteger(firstPageSize) || firstPageSize <= 0) return [];
-  const pageCount = Math.ceil(advertisedTotal / firstPageSize);
+function remainingCompanyPages({ advertisedTotal, firstPageSize, lastPage = null, maxPages }) {
+  if (!Number.isInteger(lastPage) || lastPage <= 0) return [];
+  const pageCount = lastPage;
   const safePageCount = Math.min(pageCount, maxPages);
   return Array.from({ length: Math.max(0, safePageCount - 1) }, (_, index) => index + 2);
 }
