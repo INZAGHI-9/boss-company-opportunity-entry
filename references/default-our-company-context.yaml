@@ -12,6 +12,10 @@ products:
     primary_users: ["品牌", "商家", "达人", "MCN机构"]
     workflows: ["内容创作", "营销决策", "电商带货"]
     capabilities: ["内容与创意洞察", "品牌与行业分析", "商品与达人分析", "经营复盘"]
+    sales_entry:
+      decision_moments: ["新品上市前的品类、竞品、内容与达人判断", "重点商品的内容与经营复盘"]
+      first_meeting_material: "围绕一个指定商品的品类、竞品、内容与达人参照"
+      do_not_claim: ["预算", "采购替换", "GMV提升"]
 
   - id: "chanmama_creative"
     name: "蝉妈妈·创意"
@@ -20,6 +24,10 @@ products:
     primary_users: ["内容团队", "广告投放团队", "品牌商家"]
     workflows: ["广告素材洞察", "素材拆解", "视频创作提效"]
     capabilities: ["广告素材分析", "跑量分析", "脚本拆解", "创作工具"]
+    sales_entry:
+      decision_moments: ["素材复盘后决定下一轮脚本与创作方向", "广告素材测试中的版本选择"]
+      first_meeting_material: "一组已投放素材到下一轮脚本或 briefing 的对照"
+      do_not_claim: ["爆款率", "现有团队效率问题", "采购意向"]
 
   - id: "chanjing"
     name: "蝉镜"
@@ -28,6 +36,10 @@ products:
     primary_users: ["IP达人", "品牌商家", "企业团队", "教师"]
     workflows: ["数字人视频", "线索获客", "内容生产"]
     capabilities: ["数字人视频", "AI文案", "批量成片", "私域引流"]
+    sales_entry:
+      decision_moments: ["需要持续生产标准化内容", "需要为线索场景准备内容素材"]
+      first_meeting_material: "一个已确认内容任务的样片与制作流程对照"
+      do_not_claim: ["内容产能缺口", "线索结果", "采购意向"]
 
   - id: "joggai"
     name: "JoggAI"
@@ -36,6 +48,10 @@ products:
     primary_users: ["全球品牌广告团队"]
     workflows: ["全球广告创作", "广告视频批量生产"]
     capabilities: ["UGC数字人", "链接转视频", "多语种视频", "团队协作"]
+    sales_entry:
+      decision_moments: ["全球广告团队需要批量制作多语种 UGC 视频", "广告创意需要快速形成可测试版本"]
+      first_meeting_material: "一个已确认商品或落地页的多语种广告样例"
+      do_not_claim: ["海外投放计划", "广告效果", "采购意向"]
 
   - id: "kolkoc"
     name: "蝉圈圈"
@@ -44,6 +60,10 @@ products:
     primary_users: ["品牌商家", "达人营销团队"]
     workflows: ["达人筛选", "合作管理", "营销效果追踪"]
     capabilities: ["达人匹配", "合作管理", "营销衡量", "工作流管理"]
+    sales_entry:
+      decision_moments: ["达人筛选和合作管理", "达人合作后的营销效果复盘"]
+      first_meeting_material: "一个已确认营销项目的达人筛选或复盘清单"
+      do_not_claim: ["达人合作预算", "现有管理缺陷", "采购意向"]
 
   - id: "chanxuan"
     name: "蝉选"
@@ -52,3 +72,7 @@ products:
     primary_users: ["达人", "商家"]
     workflows: ["达人选品", "商家分销", "内容共创"]
     capabilities: ["高佣选品", "达人变现", "达人分销", "增长服务"]
+    sales_entry:
+      decision_moments: ["达人选品", "商家分销与内容共创"]
+      first_meeting_material: "一个已确认商品或达人合作任务的选品清单"
+      do_not_claim: ["分销计划", "佣金预算", "采购意向"]

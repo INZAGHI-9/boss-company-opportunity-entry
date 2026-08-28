@@ -18,11 +18,18 @@ import {
   sleep,
   stopDedicatedChrome,
 } from "./cdp-client.mjs";
+import { assertPageAccessible } from "./access-guard.mjs";
 import { createAnalysisInput } from "./analysis-input.mjs";
 import { createJsonCheckpointWriter } from "./checkpoint-writer.mjs";
-import { companyHomeUrl, companyJobUrl } from "./company-navigation.mjs";
+import { companyHomeUrl, companyJobUrl, companyPositionJobUrl } from "./company-navigation.mjs";
 import { conflictingCompanyPages, mergeCompanyPageJobs, remainingCompanyPages } from "./company-page-batch.mjs";
+import {
+  reconcileCoverageWithCompletedJobs,
+  selectCollectiblePositionTabs,
+  summarizePositionTabCoverage,
+} from "./position-tab-coverage.mjs";
 import { waitForResult } from "./page-readiness.mjs";
+import { waitBetweenPages } from "./page-pacing.mjs";
 import { runRecoveryQueue, runSequentialFallback } from "./recovery-queue.mjs";
 import { acquireScoutRunLock } from "./scout-run-lock.mjs";
 
@@ -33,7 +40,6 @@ const OUTPUT_ROOT = path.join(DATA_ROOT, "output");
 const BOSS_HOME = "https://www.zhipin.com/";
 const SEARCH_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json";
 const COMPANY_JOB_LIST_PATH = "/wapi/zpgeek/brand/job/querylist.json";
-const JOB_DETAIL_PATH = "/wapi/zpgeek/seo/job/detail.json";
 const FIXED_WORKER_COUNT = 3;
 
 function parseArgs(argv) {
@@ -144,19 +150,6 @@ function randomDelay(options, factor = 1) {
   return sleep(Math.round(milliseconds * factor));
 }
 
-function assertPageAccessible(state) {
-  const text = state?.bodyText || "";
-  if (!state?.url || state.url === "about:blank") {
-    throw new Error("Boss 页面变成了 about:blank，已停止，避免继续产生请求");
-  }
-  if (/安全验证|访问异常|请完成验证|环境存在异常|访问频繁|captcha/i.test(text)) {
-    throw new Error("Boss 要求安全验证或限制访问。请手动处理或稍后再试；脚本不会绕过验证");
-  }
-  if (/扫码登录|手机号登录|登录后查看|登录\/注册/.test(text)) {
-    throw new Error("专用 Chrome 的 Boss 登录状态不可用，请先运行 --login-only");
-  }
-}
-
 function assertJobListResponse(data) {
   const code = data?.code;
   const message = String(data?.message || data?.msg || "");
@@ -177,18 +170,6 @@ function assertCompanyJobListResponse(data, brandId) {
   assertJobListResponse(data);
   const mismatched = data.zpData.jobList.find(job => job.encryptBrandId !== brandId);
   if (mismatched) throw new Error("公司岗位接口混入了其他公司 ID，已停止采集");
-}
-
-function assertJobDetailResponse(data, jobId) {
-  const code = data?.code;
-  const message = String(data?.message || data?.msg || "");
-  if (code !== undefined && code !== 0) {
-    throw new Error(`Boss 岗位详情接口返回 code=${code}${message ? `：${message}` : ""}`);
-  }
-  if (!data?.zpData?.jobInfo?.postDescription) throw new Error("Boss 岗位详情接口缺少完整职位描述");
-  if (jobId && data.zpData.jobInfo.encryptId !== jobId) {
-    throw new Error(`岗位详情 ID 不匹配：期望 ${jobId}，实际 ${data.zpData.jobInfo.encryptId || "空"}`);
-  }
 }
 
 class ResponseCapture {
@@ -333,7 +314,7 @@ async function collectSearchResults(client, page, options) {
 function isManualRecoveryError(error, failure = {}) {
   const message = error?.message || "";
   if (/登录状态不可用/i.test(message)) return true;
-  if (/安全验证|限制访问|about:blank/i.test(message)) return true;
+  if (/安全验证|访问受限|限制访问|异常行为|about:blank/i.test(message)) return true;
   return false;
 }
 
@@ -366,11 +347,23 @@ function companyPageSummaryExpression(brandId, companyName, sourcePage = 1) {
     const next = document.querySelector('a[ka="page-next"]');
     const hasMore = Boolean(next && !next.classList.contains("disabled") && next.getAttribute("aria-disabled") !== "true");
     const pageCompany = document.title.match(/「(.+?)招聘」/)?.[1] || ${JSON.stringify(companyName)};
+    const positionTabs = [...document.querySelectorAll('li[ka^="position_"]')].map(item => {
+      const anchor = item.querySelector("a");
+      const value = clean(item);
+      const match = value.match(/^(.*)\\((\\d+)\\)$/);
+      return {
+        key: item.getAttribute("ka") || "",
+        label: match?.[1] || value,
+        advertisedCount: Number(match?.[2] || 0),
+        href: anchor?.getAttribute("href") || "",
+      };
+    });
     return {
       advertisedTotal,
       lastPage: pageNumbers.length ? Math.max(...pageNumbers) : null,
       hasMore,
       company: pageCompany,
+      positionTabs,
       jobs: cards.map((card, sourceIndex) => {
         const anchor = card.querySelector("a.job-name[href*='/job_detail/']");
         const href = anchor?.getAttribute("href") || "";
@@ -421,6 +414,7 @@ async function clickCompanyNextPage(client, sessionId) {
 }
 
 async function collectParallelCompanyPage(client, page, candidate, sourcePage) {
+  await waitBetweenPages();
   await navigate(client, page.sessionId, companyJobUrl(candidate.brandId, sourcePage));
   await sleep(500);
   assertPageAccessible(await getPageState(client, page.sessionId));
@@ -440,6 +434,152 @@ async function collectParallelCompanyPage(client, page, candidate, sourcePage) {
   };
 }
 
+function annotatePositionTabJobs(jobs, tab, sourcePage) {
+  const sourceUrl = companyPositionJobUrl(tab.href, sourcePage);
+  const sourceKey = `${tab.key}:${sourcePage}`;
+  return jobs.map(job => ({
+    ...job,
+    sourceTab: tab.key,
+    sourceLabel: tab.label,
+    sourcePage,
+    sourceKey,
+    sourceUrl,
+  }));
+}
+
+async function collectPositionTabPage(client, page, candidate, tab, sourcePage, paceBeforeNavigation = false) {
+  if (paceBeforeNavigation) await waitBetweenPages();
+  await navigate(client, page.sessionId, companyPositionJobUrl(tab.href, sourcePage));
+  await sleep(500);
+  assertPageAccessible(await getPageState(client, page.sessionId));
+  const renderedPage = await evaluate(
+    client,
+    page.sessionId,
+    companyPageSummaryExpression(candidate.brandId, candidate.company, sourcePage),
+  );
+  const jobs = annotatePositionTabJobs(mergeCompanyPageJobs(renderedPage.jobs), tab, sourcePage);
+  if (!jobs.length) throw new Error(`${tab.label}职位类型第 ${sourcePage} 页未渲染岗位卡片`);
+  return {
+    key: `${tab.key}:${sourcePage}`,
+    tabKey: tab.key,
+    tabLabel: tab.label,
+    sourcePage,
+    jobs,
+    lastPage: renderedPage.lastPage,
+    hasMore: renderedPage.hasMore,
+  };
+}
+
+async function collectCompanyPositionTabJobs(client, page, options, candidate, advertisedTotal, tabs, checkpointPath) {
+  console.log(`按职位类型遍历公司岗位：${tabs.map(tab => `${tab.label}(${tab.advertisedCount})`).join("、")}`);
+  const pageResults = new Map();
+  const failures = new Map();
+  const listingCheckpointWriter = createJsonCheckpointWriter(checkpointPath, () => ({
+    schemaVersion: 2,
+    capturedAt: new Date().toISOString(),
+    candidate,
+    advertisedTotal,
+    positionTabs: tabs,
+    pages: [...pageResults.values()].sort((left, right) => left.key.localeCompare(right.key)),
+    failures: [...failures.entries()].map(([key, failure]) => ({
+      key,
+      attempts: failure.attempts,
+      error: failure.error.message,
+    })),
+  }));
+  const persistListingCheckpoint = () => listingCheckpointWriter.persist();
+
+  const remainingPages = [];
+  for (const tab of tabs) {
+    const first = await collectPositionTabPage(client, page, candidate, tab, 1);
+    pageResults.set(first.key, first);
+    const tabPages = remainingCompanyPages({
+      advertisedTotal: tab.advertisedCount,
+      firstPageSize: first.jobs.length,
+      lastPage: first.lastPage,
+      maxPages: options.maxPages,
+    });
+    for (const sourcePage of tabPages) {
+      const key = `${tab.key}:${sourcePage}`;
+      if (!pageResults.has(key)) remainingPages.push({ key, tab, sourcePage });
+    }
+  }
+  await persistListingCheckpoint();
+
+  if (remainingPages.length) {
+    console.log(`并行加载职位类型剩余页：固定 ${FIXED_WORKER_COUNT} 个工作页，待读取 ${remainingPages.length} 页`);
+    const pool = await createFixedPagePool(client, Math.min(FIXED_WORKER_COUNT, remainingPages.length));
+    let recovery;
+    try {
+      recovery = await runRecoveryQueue(remainingPages, {
+        concurrency: pool.workers.length,
+        maxAttempts: 2,
+        workerContexts: pool.workers,
+        worker: async (task, { attempt, workerContext }) => {
+          if (attempt > 1) console.log(`恢复${task.tab.label}职位类型第 ${task.sourcePage} 页，第 ${attempt} 次尝试`);
+          return collectPositionTabPage(client, workerContext, candidate, task.tab, task.sourcePage, true);
+        },
+        isManualRecoveryError,
+        onAttemptError: async failure => {
+          failures.set(failure.item.key, failure);
+          await persistListingCheckpoint();
+        },
+        onCompleted: async ({ value }) => {
+          pageResults.set(value.key, value);
+          failures.delete(value.key);
+          await persistListingCheckpoint();
+        },
+      });
+    } finally {
+      await pool.close({ preserveTargetIds: recovery?.paused.map(failure => failure.workerContext?.targetId) || [] });
+    }
+    if (recovery.paused.length) throw recoveryError("职位类型岗位列表采集", recovery.paused);
+    if (recovery.failed.length) {
+      console.log(`职位类型并行页未完成，改为单页续采：${recovery.failed.map(failure => failure.item.key).join("、")}`);
+      const fallback = await runSequentialFallback(recovery.failed.map(failure => failure.item), {
+        worker: async task => collectPositionTabPage(client, page, candidate, task.tab, task.sourcePage, true),
+        onAttemptError: async failure => {
+          failures.set(failure.item.key, failure);
+          await persistListingCheckpoint();
+        },
+      });
+      for (const { value } of fallback.completed) {
+        pageResults.set(value.key, value);
+        failures.delete(value.key);
+      }
+      await listingCheckpointWriter.flush();
+      if (fallback.failed.length) throw recoveryError("职位类型岗位列表单页续采", fallback.failed);
+    }
+  }
+
+  const tabResults = tabs.map(tab => {
+    const pages = [...pageResults.values()]
+      .filter(result => result.tabKey === tab.key)
+      .sort((left, right) => left.sourcePage - right.sourcePage);
+    const lastPage = pages.at(-1);
+    return {
+      key: tab.key,
+      jobIds: pages.flatMap(result => result.jobs.map(job => job.jobId)),
+      pagesCaptured: pages.length,
+      terminalReached: Boolean(lastPage && lastPage.hasMore === false),
+    };
+  });
+  const coverage = summarizePositionTabCoverage({ advertisedTotal, tabs, tabResults });
+  coverage.pagesCaptured = [...pageResults.values()].length;
+  coverage.maxPages = options.maxPages;
+  const jobs = new Map();
+  for (const result of pageResults.values()) {
+    for (const job of result.jobs) jobs.set(job.jobId, job);
+  }
+  await listingCheckpointWriter.flush();
+  if (!coverage.complete && !coverage.toleratedGap) {
+    console.log(`公司岗位快照不完整：页面公布 ${coverage.advertisedTotal} 条，职位类型去重 ${coverage.collectedTotal} 条，缺 ${coverage.missingCount} 条（${(coverage.missingRatio * 100).toFixed(1)}%）。`);
+  } else if (coverage.toleratedGap) {
+    console.log(`公司岗位快照存在允许的动态缺口：页面公布 ${coverage.advertisedTotal} 条，职位类型去重 ${coverage.collectedTotal} 条，缺 ${coverage.missingCount} 条（${(coverage.missingRatio * 100).toFixed(1)}%）。`);
+  }
+  return { jobs: [...jobs.values()], coverage };
+}
+
 async function collectCompanyJobs(client, page, options, candidate, checkpointPath) {
   console.log(`打开公司主页：${candidate.company}（${candidate.brandId}）`);
   await navigate(client, page.sessionId, companyHomeUrl(candidate.brandId));
@@ -457,6 +597,18 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
     companyPageSummaryExpression(candidate.brandId, candidate.company),
   );
   if (firstPage.company) candidate.company = firstPage.company;
+  const positionTabs = selectCollectiblePositionTabs(firstPage.positionTabs);
+  if (positionTabs.length) {
+    return collectCompanyPositionTabJobs(
+      client,
+      page,
+      options,
+      candidate,
+      firstPage.advertisedTotal,
+      positionTabs,
+      checkpointPath,
+    );
+  }
   const jobs = new Map(firstPage.jobs.map(job => [job.jobId, job]));
   let advertisedTotal = firstPage.advertisedTotal;
   let apiTotal = null;
@@ -473,16 +625,6 @@ async function collectCompanyJobs(client, page, options, candidate, checkpointPa
     hasMore: lastHasMore,
   }]]);
   const failures = new Map();
-  const existingCheckpoint = await loadJson(checkpointPath, null);
-  if (!options.refreshListing
-    && existingCheckpoint?.candidate?.brandId === candidate.brandId
-    && existingCheckpoint?.advertisedTotal === advertisedTotal) {
-    for (const result of existingCheckpoint.pages || []) {
-      if (result?.sourcePage > 1 && Array.isArray(result.jobs) && result.jobs.length) {
-        pageResults.set(result.sourcePage, result);
-      }
-    }
-  }
   const listingCheckpointWriter = createJsonCheckpointWriter(checkpointPath, () => ({
       schemaVersion: 1,
       capturedAt: new Date().toISOString(),
@@ -704,102 +846,77 @@ function inlineExtractionExpression(job) {
   })()`;
 }
 
-function mapDetailResponse(job, data) {
-  assertJobDetailResponse(data, job.jobId);
-  const detail = data.zpData;
-  const info = detail.jobInfo;
-  const boss = detail.bossInfo || {};
-  const brand = detail.brandComInfo || {};
-  return {
-    ...job,
-    securityId: detail.securityId || job.securityId,
-    lid: detail.lid || job.lid,
-    title: info.jobName || job.title,
-    salary: info.salaryDesc || job.salary,
-    city: info.locationName || job.city,
-    location: normalizeLocation([info.locationName || job.city, job.district, job.businessDistrict].join("·")),
-    experience: info.experienceName || job.experience,
-    degree: info.degreeName || job.degree,
-    skills: info.showSkills || job.skills || [],
-    benefits: brand.labels || job.benefits || [],
-    companyScale: brand.scaleName || job.companyScale || "",
-    companyStage: brand.stageName || job.companyStage || "",
-    companyIndustry: brand.industryName || job.companyIndustry || "",
-    description: info.postDescription,
-    address: info.address || "",
-    jobStatus: info.jobStatusDesc || "",
-    recruiter: boss.name || job.recruiter || "",
-    recruiterTitle: boss.title || job.recruiterTitle || "",
-    recruiterActive: boss.activeTimeDesc || "",
-    recruiterOnline: Boolean(boss.bossOnline),
-    requirementTags: info.showSkills || [],
-    finalUrl: job.jobLink,
-    capturedAt: new Date().toISOString(),
-  };
+function missingJobCardError(jobId) {
+  const error = new Error(`岗位卡片当前页已不可见：${jobId}`);
+  error.code = "JOB_CARD_NOT_VISIBLE";
+  return error;
 }
 
-async function clickCompanyJobCard(client, sessionId, jobId) {
-  const result = await waitForResult(async () => evaluate(client, sessionId, `(() => {
+async function readCompanyJobCardState(client, sessionId, jobId, click = false) {
+  return evaluate(client, sessionId, `(() => {
     const cards = [...document.querySelectorAll(".job-card-box")];
     const card = cards.find(item => item.querySelector("a.job-name")?.href.includes(${JSON.stringify(jobId)}));
     if (!card) return null;
     const active = card.classList.contains("active");
-    if (!active) card.click();
+    if (${click ? "true" : "false"} && !active) card.click();
     return { active };
-  })()`), { label: `岗位卡片 ${jobId}` });
+  })()`);
+}
+
+async function clickCompanyJobCard(client, sessionId, jobId) {
+  const result = await readCompanyJobCardState(client, sessionId, jobId, true);
+  if (!result) throw missingJobCardError(jobId);
   return result.active;
 }
 
-async function extractInlineDetail(client, page, job, capture, parallel = false) {
+async function extractInlineDetail(client, page, job, parallel = false) {
   if (!parallel) await enforceSinglePage(client, page.targetId);
-  const activeCard = await waitForResult(async () => evaluate(client, page.sessionId, `(() => {
-    const card = [...document.querySelectorAll(".job-card-box")]
-      .find(item => item.querySelector("a.job-name")?.href.includes(${JSON.stringify(job.jobId)}));
-    return card ? { active: card.classList.contains("active") } : null;
-  })()`), { label: `岗位卡片 ${job.jobId}` });
-  let detail;
-  if (activeCard.active) {
-    detail = await evaluate(client, page.sessionId, inlineExtractionExpression(job));
-  } else {
-    try {
-      const data = await capture.nextMatching(
-        20_000,
-        () => clickCompanyJobCard(client, page.sessionId, job.jobId),
-        response => response?.zpData?.jobInfo?.encryptId === job.jobId
-          && Boolean(response.zpData.jobInfo.postDescription),
-      );
-      detail = mapDetailResponse(job, data);
-    } catch {
-      detail = await waitForResult(async () => {
-        const fallback = await evaluate(client, page.sessionId, inlineExtractionExpression(job));
-        return fallback.description ? fallback : null;
-      }, { label: `岗位详情 ${job.jobId}` });
-    }
-  }
+  const activeCard = await readCompanyJobCardState(client, page.sessionId, job.jobId);
+  if (!activeCard) throw missingJobCardError(job.jobId);
+  if (!activeCard.active) await clickCompanyJobCard(client, page.sessionId, job.jobId);
+  const detail = await waitForResult(async () => {
+    const rendered = await evaluate(client, page.sessionId, inlineExtractionExpression(job));
+    return rendered.description ? rendered : null;
+  }, {
+    timeout: 3_000,
+    label: `前端岗位详情 ${job.jobId}`,
+    onPending: async () => assertPageAccessible(await getPageState(client, page.sessionId)),
+  });
   assertPageAccessible(await getPageState(client, page.sessionId));
-  if (!detail.description) detail.detailWarning = "未从当前详情页定位到职位描述";
   return detail;
 }
 
 async function collectCompanyPageDetails(client, page, options, candidate, targets, details, parallel, persistCheckpoint) {
   const pendingTargets = targets.filter(job => !details.has(job.jobId));
   if (!pendingTargets.length) return;
-  const capture = new ResponseCapture(client, page.sessionId, JOB_DETAIL_PATH, "岗位详情接口");
-  try {
-    await navigate(client, page.sessionId, companyJobUrl(candidate.brandId, pendingTargets[0].sourcePage));
-    await sleep(500);
-    assertPageAccessible(await getPageState(client, page.sessionId));
-    for (const job of pendingTargets) {
-      const index = options.allTargets.findIndex(target => target.jobId === job.jobId);
-      console.log(`读取第 ${job.sourcePage} 页详情 ${index + 1}/${options.allTargets.length}: ${job.title}`);
-      const detail = await extractInlineDetail(client, page, job, capture, parallel);
+  await navigate(
+    client,
+    page.sessionId,
+    pendingTargets[0].sourceUrl || companyJobUrl(candidate.brandId, pendingTargets[0].sourcePage),
+  );
+  await sleep(500);
+  assertPageAccessible(await getPageState(client, page.sessionId));
+  const pageFailures = [];
+  for (const job of pendingTargets) {
+    const index = options.allTargets.findIndex(target => target.jobId === job.jobId);
+    const source = job.sourceLabel ? `${job.sourceLabel}第 ${job.sourcePage} 页` : `第 ${job.sourcePage} 页`;
+    console.log(`读取${source}详情 ${index + 1}/${options.allTargets.length}: ${job.title}`);
+    try {
+      const detail = await extractInlineDetail(client, page, job, parallel);
       if (!detail.description) throw new Error(`岗位详情页没有读取到职位描述：${job.jobId}`);
       details.set(job.jobId, detail);
       await persistCheckpoint();
-      if (!parallel) await randomDelay(options);
+    } catch (error) {
+      if (isManualRecoveryError(error)) throw error;
+      pageFailures.push({ job, error });
+      console.log(`岗位详情暂未读取：${job.jobId}：${error.message}`);
     }
-  } finally {
-    capture.dispose();
+    if (!parallel) await randomDelay(options);
+  }
+  if (pageFailures.length) {
+    const error = new Error(`当前页 ${pageFailures.length} 个岗位详情未读取：${pageFailures.map(failure => failure.job.jobId).join("、")}`);
+    error.missingJobIds = pageFailures.map(failure => failure.job.jobId);
+    throw error;
   }
 }
 
@@ -817,11 +934,12 @@ async function collectCompanyDetails(client, page, options, candidate, jobs, det
   if (options.parallelDetails && pending.length) {
     const groups = new Map();
     for (const job of pending) {
-      const group = groups.get(job.sourcePage) || [];
+      const sourceKey = job.sourceKey || String(job.sourcePage);
+      const group = groups.get(sourceKey) || [];
       group.push(job);
-      groups.set(job.sourcePage, group);
+      groups.set(sourceKey, group);
     }
-    const pageNumbers = [...groups.keys()].sort((left, right) => left - right);
+    const pageNumbers = [...groups.keys()].sort();
     console.log(`按岗位分页并行读取详情：固定 ${FIXED_WORKER_COUNT} 个工作页，${pending.length} 份 JD`);
     const parallelOptions = { ...options, allTargets: targets };
     const pool = await createFixedPagePool(client, Math.min(FIXED_WORKER_COUNT, pageNumbers.length));
@@ -832,7 +950,7 @@ async function collectCompanyDetails(client, page, options, candidate, jobs, det
         maxAttempts: 2,
         workerContexts: pool.workers,
         worker: async (pageNumber, { attempt, workerContext }) => {
-          if (attempt > 1) console.log(`恢复第 ${pageNumber} 页 JD，第 ${attempt} 次尝试`);
+          if (attempt > 1) console.log(`恢复${pageNumber} JD，第 ${attempt} 次尝试`);
           await collectCompanyPageDetails(
             client,
             workerContext,
@@ -882,26 +1000,25 @@ async function collectCompanyDetails(client, page, options, candidate, jobs, det
     }
     return targets;
   }
-  const pageNumbers = [...new Set(targets.filter(job => !details.has(job.jobId)).map(job => job.sourcePage))]
-    .sort((left, right) => left - right);
-  const capture = new ResponseCapture(client, page.sessionId, JOB_DETAIL_PATH, "岗位详情接口");
-  try {
-    for (const pageNumber of pageNumbers) {
-      await navigate(client, page.sessionId, companyJobUrl(candidate.brandId, pageNumber));
-      await sleep(1_200);
-      assertPageAccessible(await getPageState(client, page.sessionId));
-      const pageTargets = targets.filter(job => job.sourcePage === pageNumber && !details.has(job.jobId));
-      for (const job of pageTargets) {
-        const index = targets.findIndex(target => target.jobId === job.jobId);
-        console.log(`读取同页详情 ${index + 1}/${targets.length}: ${job.title} | ${job.location}`);
-        const detail = await extractInlineDetail(client, page, job, capture);
-        details.set(job.jobId, detail);
-        await persistCheckpoint();
-        await randomDelay(options);
-      }
+  const pageNumbers = [...new Set(targets.filter(job => !details.has(job.jobId)).map(job => job.sourceKey || String(job.sourcePage)))]
+    .sort();
+  for (const pageNumber of pageNumbers) {
+    const pageTargets = targets.filter(job => (job.sourceKey || String(job.sourcePage)) === pageNumber && !details.has(job.jobId));
+    await navigate(
+      client,
+      page.sessionId,
+      pageTargets[0].sourceUrl || companyJobUrl(candidate.brandId, pageTargets[0].sourcePage),
+    );
+    await sleep(1_200);
+    assertPageAccessible(await getPageState(client, page.sessionId));
+    for (const job of pageTargets) {
+      const index = targets.findIndex(target => target.jobId === job.jobId);
+      console.log(`读取同页详情 ${index + 1}/${targets.length}: ${job.title} | ${job.location}`);
+      const detail = await extractInlineDetail(client, page, job);
+      details.set(job.jobId, detail);
+      await persistCheckpoint();
+      await randomDelay(options);
     }
-  } finally {
-    capture.dispose();
   }
   await persistCheckpoint.flush();
   return targets;
@@ -1033,7 +1150,11 @@ function analyze(jobs, candidate, coverage) {
   }
   const senior = jobs.filter(job => /3-5年|5-10年|10年以上/.test(job.experience) || /资深|专家|负责人|总监/.test(job.title)).length;
   if (senior / total >= 0.4) signals.push(`中高经验或资深岗位约占 ${percent(senior, total)}，招聘更偏成熟人才而非大规模初级人才补充。`);
-  if (!coverage.complete) signals.push("公司岗位页未完整遍历，当前快照不应视为该公司的全部在招岗位。");
+  if (coverage.toleratedGap) {
+    signals.push(`公司岗位页存在 ${percent(coverage.missingCount, coverage.advertisedTotal)} 的动态缺口，处于允许范围；当前快照仍不等同于逐岗零缺失名单。`);
+  } else if (!coverage.complete) {
+    signals.push("公司岗位页未完整遍历，当前快照不应视为该公司的全部在招岗位。");
+  }
   if (!signals.length) signals.push("当前样本没有形成单一强特征，建议结合下一次快照观察新增、下线与长期在招岗位。");
   return { candidate, total, cities, families, experience, degrees, salaries, workModes, skills, signals, coverage };
 }
@@ -1054,8 +1175,10 @@ function distributionRows(items, total) {
 
 function buildAppendix(jobs, analysis, capturedAt) {
   const coverageText = analysis.coverage.complete
-    ? `公司岗位页已完整遍历 ${analysis.coverage.pagesCaptured} 页，去重结果 ${analysis.coverage.collectedTotal}/${analysis.coverage.advertisedTotal}`
-    : `公司岗位页仅读取 ${analysis.coverage.pagesCaptured} 页，去重结果 ${analysis.coverage.collectedTotal}/${analysis.coverage.advertisedTotal}`;
+    ? `职位类型已完整遍历 ${analysis.coverage.pagesCaptured} 页，去重结果 ${analysis.coverage.collectedTotal}/${analysis.coverage.advertisedTotal}`
+    : analysis.coverage.toleratedGap
+      ? `职位类型已遍历 ${analysis.coverage.pagesCaptured} 页，去重结果 ${analysis.coverage.collectedTotal}/${analysis.coverage.advertisedTotal}，动态缺口 ${percent(analysis.coverage.missingCount, analysis.coverage.advertisedTotal)}（允许范围内）`
+      : `职位类型仅读取 ${analysis.coverage.pagesCaptured} 页，去重结果 ${analysis.coverage.collectedTotal}/${analysis.coverage.advertisedTotal}`;
   const jobRows = jobs.map(job => [
     job.title,
     job.location || job.address || "",
@@ -1073,7 +1196,7 @@ function buildAppendix(jobs, analysis, capturedAt) {
 - Boss 公司 ID：${analysis.candidate.brandId}
 - 公司当前在招岗位：${analysis.total}
 - 公司页覆盖：${coverageText}
-- 口径：关键词搜索仅用于确认公司主体；岗位全集来自该 Boss 公司 ID 的招聘职位页，并按岗位 ID 去重
+- 口径：关键词搜索仅用于确认公司主体；职位类型逐一遍历并按岗位 ID 合并。动态岗位可存在允许缺口，具体比例见公司页覆盖。
 
 ## 核心判断
 
@@ -2038,7 +2161,30 @@ async function main() {
         );
         break;
       } catch (error) {
-        if (error?.code !== "DETAIL_LIST_REFRESH_REQUIRED" || listingRefresh) throw error;
+        if (error?.code !== "DETAIL_LIST_REFRESH_REQUIRED") throw error;
+        if (!listingRefresh) continue;
+        const completedJobs = companyList.jobs.filter(job => String(details.get(job.jobId)?.description || "").trim());
+        const reconciledCoverage = reconcileCoverageWithCompletedJobs(companyList.coverage, completedJobs.map(job => ({
+          ...job,
+          description: details.get(job.jobId)?.description || "",
+        })));
+        if (!reconciledCoverage.complete && !reconciledCoverage.toleratedGap) throw error;
+        const unavailableCount = companyList.jobs.length - completedJobs.length;
+        console.log(`刷新后仍有 ${unavailableCount} 个岗位未取得 JD；已按动态缺口口径从本次快照剔除。`);
+        companyList = { ...companyList, jobs: completedJobs, coverage: reconciledCoverage };
+        candidate = {
+          ...candidate,
+          count: completedJobs.length,
+          cities: [...new Set(completedJobs.map(job => job.city).filter(Boolean))].sort(),
+        };
+        targets = completedJobs;
+        await writeJson(path.join(runDirectory, "list.json"), {
+          capturedAt: new Date().toISOString(),
+          candidate,
+          coverage: companyList.coverage,
+          jobs: companyList.jobs,
+        });
+        break;
       }
     }
     if (!companyList || !details || !targets) throw new Error("岗位 JD 采集未形成完整快照");

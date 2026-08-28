@@ -8,4 +8,11 @@ function companyJobUrl(brandId, page = 1) {
   return url.toString();
 }
 
-export { companyHomeUrl, companyJobUrl };
+function companyPositionJobUrl(href, page = 1) {
+  const url = new URL(href, "https://www.zhipin.com");
+  if (page > 1) url.searchParams.set("page", String(page));
+  else url.searchParams.delete("page");
+  return url.toString();
+}
+
+export { companyHomeUrl, companyJobUrl, companyPositionJobUrl };

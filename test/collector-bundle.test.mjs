@@ -9,11 +9,14 @@ const collectorDirectory = path.join(skillDirectory, "scripts", "collector");
 const requiredModules = [
   "boss-company-scout.mjs",
   "analysis-input.mjs",
+  "access-guard.mjs",
   "cdp-client.mjs",
   "checkpoint-writer.mjs",
   "company-navigation.mjs",
   "company-page-batch.mjs",
+  "position-tab-coverage.mjs",
   "page-readiness.mjs",
+  "page-pacing.mjs",
   "recovery-queue.mjs",
   "scout-run-lock.mjs",
 ];
@@ -26,6 +29,10 @@ test("packages the complete Boss collector inside the opportunity-entry skill", 
   const instructions = readFileSync(path.join(skillDirectory, "SKILL.md"), "utf8");
   assert.match(instructions, /scripts\/collector\/boss-company-scout\.mjs/);
   assert.match(instructions, /--check-login[\s\S]*自动选择 `brandId`[\s\S]*完整 JD[\s\S]*opportunity-entry-report\.md/);
+  assert.match(instructions, /职位类型/);
+  assert.match(instructions, /排除“全部”/);
+  assert.match(instructions, /10%/);
+  assert.match(instructions, /访问受限/);
   assert.doesNotMatch(instructions, /仅请求用户选择/);
   assert.doesNotMatch(instructions, /boss-company-talent-map/);
 });
@@ -77,6 +84,30 @@ test("emits the analysis-input contract required by the opportunity report", asy
     employmentMode: null,
     description: "完整 JD",
   }]);
+});
+
+test("preserves a tolerated dynamic-listing gap in the analysis input", async () => {
+  const inputModule = pathToFileURL(path.join(collectorDirectory, "analysis-input.mjs")).href;
+  const { createAnalysisInput } = await import(inputModule);
+  const input = createAnalysisInput({
+    candidate: { company: "示例公司", brandId: "brand-1" },
+    coverage: {
+      complete: false,
+      toleratedGap: true,
+      advertisedTotal: 463,
+      collectedTotal: 454,
+      pagesCaptured: 31,
+      missingCount: 9,
+      missingRatio: 9 / 463,
+      allowedMissingRatio: 0.1,
+    },
+    capturedAt: "2026-08-27T00:00:00.000Z",
+    jobs: [{ jobId: "job-1", title: "内容运营", description: "完整 JD" }],
+  });
+
+  assert.equal(input.snapshot.status, "tolerated_gap");
+  assert.match(input.snapshot.limitation, /9 个岗位/);
+  assert.match(input.snapshot.limitation, /10.0%/);
 });
 
 test("retains the business-and-talent collector safeguards while adapting only the output contract", async () => {
